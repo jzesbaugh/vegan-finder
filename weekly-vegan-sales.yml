@@ -36,8 +36,9 @@ jobs:
           Weekly Kroger plant-based sale check.
 
           Authenticates to the Kroger public API with the client_credentials grant,
-          resolves a store from a ZIP code, searches a curated set of plant-based
-          terms, and reports items whose promo price beats their regular price.
+          resolves a store from a ZIP code, searches a curated list of brands that
+          are vegan across their entire line, and reports items whose promo price
+          beats their regular price.
 
           Outputs a markdown digest on stdout and, when GITHUB_OUTPUT is set,
           exposes `has_deals`, `title` and `body` for the calling workflow.
@@ -53,6 +54,7 @@ jobs:
 
           import base64
           import json
+          import re
           import os
           import sys
           import time
@@ -60,63 +62,73 @@ jobs:
           import urllib.parse
           import urllib.request
 
-          API_BASE = os.environ.get("KROGER_API_BASE", "https://api.kroger.com").rstrip("/")
+          API_BASE = (os.environ.get("KROGER_API_BASE") or "https://api.kroger.com").rstrip("/")
           TIMEOUT = 30
 
           # ---------------------------------------------------------------------------
-          # What we search for.
+          # Brand-driven search.
           #
-          # The Kroger API has no "vegan" flag, so this is term-driven. Every term below
-          # names a category that is plant-based by definition or by overwhelming
-          # convention. Anything whose description trips DISALLOWED is dropped; anything
-          # ambiguous is reported in a separate "check the label" section rather than
-          # being presented as vegan.
+          # Every brand below is vegan across its ENTIRE line, so anything the API
+          # returns under that brand is safe without inspecting the description. This
+          # replaced term-based searching on 2026-09-05: terms like "veggie burger" and
+          # "oat milk" dragged in hamburger buns, instant oatmeal, dairy yogurt and hand
+          # soap, and worse, "non-dairy" wrongly confirmed Coffee Mate creamers that
+          # contain sodium caseinate (a milk protein).
+          #
+          # The bar for this list is the whole brand, not a product. A brand with even
+          # one dairy, egg, fish or honey item does NOT belong here -- put it in
+          # MIXED_BRAND_NOTES instead so the reason is recorded.
           # ---------------------------------------------------------------------------
-          SEARCH_TERMS = [
-              # tofu / tempeh / seitan
-              "tofu", "tempeh", "seitan",
+          VEGAN_BRANDS = [
               # meat analogues
-              "plant based burger", "plant based chicken", "plant based sausage",
-              "meatless", "veggie burger", "Beyond Meat", "Impossible",
-              "Gardein", "Field Roast", "Tofurky", "Lightlife",
-              # milks
-              "oat milk", "almond milk", "soy milk", "cashew milk", "coconut milk",
-              "Oatly", "Silk", "Califia",
-              # yogurt / cheese / butter / cream
-              "dairy free yogurt", "vegan cheese", "dairy free cheese",
-              "vegan butter", "dairy free creamer",
-              "Miyoko", "Violife", "Kite Hill", "Daiya", "Follow Your Heart",
-              "So Delicious", "Forager", "Chao",
-              # frozen / misc
-              "vegan ice cream", "dairy free ice cream", "plant based",
+              "Beyond Meat", "Beyond Burger", "Impossible", "Gardein", "Tofurky",
+              "Lightlife", "Field Roast", "Actual Veggies",
+              # dairy analogues
+              "Daiya", "Violife", "Miyoko's Creamery", "Miyoko", "Follow Your Heart",
+              "So Delicious", "Forager", "Kite Hill", "Chao",
+              # milks, creamers, drinks
+              "Silk", "Califia Farms", "Planet Oat", "Almond Breeze", "Oatly",
+              "Ripple", "Thai Coco", "Rise",
+              # yogurt
+              "Cocojune",
+              # eggs
+              "Just Egg", "JUST Egg",
           ]
 
-          # If any of these appear in a product's description, it is not vegan.
+          # Brands deliberately EXCLUDED, with the reason. These carry vegan products but
+          # are not vegan brands, so a brand-level match would be unsafe.
+          MIXED_BRAND_NOTES = {
+              "Coffee mate": "regular 'Non-Dairy' line contains sodium caseinate (milk protein)",
+              "Starbucks": "sells dairy creamers alongside the almond/oat ones",
+              "Best Foods": "mayonnaise line is egg-based; only the Plant Based SKU qualifies",
+              "Philadelphia": "a dairy cream cheese brand with one plant-based line",
+              "Breyers": "a dairy ice cream brand with one non-dairy line",
+              "Annie's": "most mac and cheese is dairy; only SKUs labelled Vegan qualify",
+              "Simple Truth": "Kroger house organic line spanning meat and dairy",
+              "Thai Kitchen": "also sells fish sauce",
+              "Blue Diamond": "also sells honey-roasted almonds",
+              "Dr. Praeger's": "veggie burgers are certified vegan but the brand also sells fish products",
+              "Orgain": "also sells whey protein",
+              "La Colombe": "most lattes are dairy; only the oatmilk ones qualify",
+          }
+
+          # Safety net. A brand on the list above should never produce a match here, but
+          # brands extend their lines. Anything caught is dropped and logged.
           DISALLOWED = [
               "milk chocolate", "buttermilk", "whey", "casein", "gelatin",
-              "honey", "beef", "pork", "chicken breast", "turkey breast",
+              "honey", " beef", "pork", "chicken breast", "turkey breast",
               "bacon", "anchov", "gouda", "cheddar cheese", "mozzarella",
               "parmesan", "greek yogurt", "half and half", "heavy cream",
               "egg ", "eggs", "lard", "tallow", "shrimp", "salmon", "tuna",
           ]
 
-          # Brand + description text containing any of these reads as reliably vegan.
-          CONFIRMING = [
-              # explicit labelling
-              "vegan", "plant based", "plant-based", "dairy free", "dairy-free",
-              "non dairy", "non-dairy", "meatless", "veggie burger",
-              # inherently plant-based foods
-              "tofu", "tempeh", "seitan",
-              # plant milks -- the category name is the confirmation
-              "oat milk", "oatmilk", "almond milk", "almondmilk", "soy milk",
-              "soymilk", "cashew milk", "coconut milk", "rice milk", "hemp milk",
-              "pea milk", "oat beverage", "almond beverage", "soy beverage",
-              # brands that are entirely or near-entirely vegan
-              "oatly", "miyoko", "violife", "beyond meat", "impossible",
-              "gardein", "field roast", "tofurky", "lightlife", "daiya",
-              "follow your heart", "so delicious", "forager", "califia",
-              "kite hill", "nasoya", "chao",
-          ]
+
+          def normalize(name):
+              """Fold brand strings for comparison: 'Gardein(R)' -> 'gardein'."""
+              return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+          VEGAN_BRAND_KEYS = {normalize(b) for b in VEGAN_BRANDS}
 
 
           def fail(msg, hint=None):
@@ -181,38 +193,71 @@ jobs:
               return store["locationId"], f"{name}, {addr}, {city}".strip(", ")
 
 
+          PAGE_SIZE = 50
+          MAX_PAGES = 5  # Kroger caps filter.limit at 50, so this is up to 250 per brand
+
+
           def search(token, term, location_id):
-              url = f"{API_BASE}/v1/products?" + urllib.parse.urlencode(
-                  {
-                      "filter.term": term,
-                      "filter.locationId": location_id,
-                      "filter.limit": 50,
-                  }
-              )
-              try:
-                  return (request(url, headers={"Authorization": f"Bearer {token}"}).get("data")) or []
-              except RuntimeError as e:
-                  print(f"  warning: search for {term!r} failed: {e}", file=sys.stderr)
-                  return []
+              """Fetch every page for a term, not just the first 50.
+
+              A single page was silently truncating large brands -- Beyond Meat alone
+              exceeds 50 SKUs at a supercenter, so items genuinely on sale (Beyond Brats,
+              reported 2026-09-05) never reached the filter.
+              """
+              out = []
+              for page in range(MAX_PAGES):
+                  url = f"{API_BASE}/v1/products?" + urllib.parse.urlencode(
+                      {
+                          "filter.term": term,
+                          "filter.locationId": location_id,
+                          "filter.limit": PAGE_SIZE,
+                          "filter.start": page * PAGE_SIZE + 1,
+                      }
+                  )
+                  try:
+                      batch = (request(
+                          url, headers={"Authorization": f"Bearer {token}"}
+                      ).get("data")) or []
+                  except RuntimeError as e:
+                      print(f"  warning: {term!r} page {page + 1} failed: {e}",
+                            file=sys.stderr)
+                      break
+                  out.extend(batch)
+                  if len(batch) < PAGE_SIZE:
+                      break
+                  time.sleep(0.2)
+              else:
+                  print(f"  note: {term!r} hit the {MAX_PAGES}-page cap; may be truncated",
+                        file=sys.stderr)
+              return out
 
 
           def classify(description, brand=""):
+              """Return 'vegan', 'excluded', or 'other'.
+
+              A product qualifies on its BRAND alone. The description is consulted only
+              to veto -- never to promote -- so a misleading label like "non-dairy"
+              can no longer let a non-vegan product through.
+              """
+              if normalize(brand) not in VEGAN_BRAND_KEYS:
+                  return "other"
               low = f"{brand} {description}".lower()
               for bad in DISALLOWED:
                   if bad in low:
                       return "excluded"
-              for good in CONFIRMING:
-                  if good in low:
-                      return "vegan"
-              return "check"
+              return "vegan"
 
 
           def extract_deals(products, min_percent):
-              deals = []
+              deals, vetoed = [], []
               for p in products:
                   desc = p.get("description") or ""
-                  verdict = classify(desc, p.get("brand") or "")
+                  brand = p.get("brand") or ""
+                  verdict = classify(desc, brand)
+                  if verdict == "other":
+                      continue
                   if verdict == "excluded":
+                      vetoed.append(f"{brand} {desc}".strip())
                       continue
                   for item in p.get("items") or []:
                       price = item.get("price") or {}
@@ -227,16 +272,15 @@ jobs:
                       deals.append(
                           {
                               "description": desc,
-                              "brand": p.get("brand") or "",
+                              "brand": brand,
                               "size": item.get("size") or "",
                               "regular": regular,
                               "promo": promo,
                               "percent": pct,
-                              "verdict": verdict,
                           }
                       )
                       break
-              return deals
+              return deals, vetoed
 
 
           def dedupe(deals):
@@ -251,48 +295,37 @@ jobs:
 
 
           def render(deals, store_label, zip_code):
-              confirmed = [d for d in deals if d["verdict"] == "vegan"]
-              uncertain = [d for d in deals if d["verdict"] == "check"]
-
               lines = [
                   f"Store: **{store_label}** (ZIP {zip_code})",
                   "",
-                  f"{len(confirmed)} plant-based items on sale"
-                  + (f", plus {len(uncertain)} needing a label check." if uncertain else "."),
-                  "",
               ]
-
-              def table(rows):
-                  out = ["| Item | Size | Was | Now | Off |", "|---|---|---|---|---|"]
-                  for d in rows:
+              if not deals:
+                  lines += [
+                      "Nothing from the tracked vegan brands is discounted this week.",
+                      "",
+                  ]
+              else:
+                  lines += [
+                      f"{len(deals)} item{'' if len(deals) == 1 else 's'} on sale.",
+                      "",
+                      "| Item | Size | Was | Now | Off |",
+                      "|---|---|---|---|---|",
+                  ]
+                  for d in deals:
                       name = f"{d['brand']} {d['description']}".strip()
-                      out.append(
+                      lines.append(
                           f"| {name} | {d['size']} | ${d['regular']:.2f} | "
                           f"${d['promo']:.2f} | {d['percent']}% |"
                       )
-                  return out
-
-              if confirmed:
-                  lines += table(confirmed) + [""]
-              else:
-                  lines += ["Nothing in the plant-based set is discounted this week.", ""]
-
-              if uncertain:
-                  lines += [
-                      "### Check the label",
-                      "",
-                      "These matched a plant-based search term but their description "
-                      "does not confirm it. The Kroger API has no vegan flag, so verify "
-                      "before buying.",
-                      "",
-                  ] + table(uncertain) + [""]
+                  lines.append("")
 
               lines += [
                   "---",
                   "",
-                  "Prices are what the Kroger API reported for this store at run time "
-                  "and can differ at the register. Digital-coupon savings are not "
-                  "included.",
+                  "Every item comes from a brand that is vegan across its whole line, so "
+                  "no label check is needed. Prices are what the Kroger API reported for "
+                  "this store at run time and can differ at the register; digital-coupon "
+                  "savings are not included.",
               ]
               return "\n".join(lines)
 
@@ -325,22 +358,26 @@ jobs:
               print(f"Store: {store_label} ({location_id})", file=sys.stderr)
 
               products = []
-              for term in SEARCH_TERMS:
-                  found = search(token, term, location_id)
-                  print(f"  {term}: {len(found)}", file=sys.stderr)
-                  products.extend(found)
+              for brand in VEGAN_BRANDS:
+                  found = search(token, brand, location_id)
+                  kept = [p for p in found if normalize(p.get("brand")) in VEGAN_BRAND_KEYS]
+                  print(f"  {brand}: {len(found)} returned, {len(kept)} on-brand",
+                        file=sys.stderr)
+                  products.extend(kept)
                   time.sleep(0.2)
 
-              deals = dedupe(extract_deals(products, min_percent))
+              raw, vetoed = extract_deals(products, min_percent)
+              for v in vetoed:
+                  print(f"  VETOED by DISALLOWED (check this brand): {v}", file=sys.stderr)
+              deals = dedupe(raw)
               body = render(deals, store_label, zip_code or location_id)
               print(body)
 
               out_path = os.environ.get("GITHUB_OUTPUT")
               if out_path:
-                  confirmed = sum(1 for d in deals if d["verdict"] == "vegan")
                   title = (
-                      f"Kroger plant-based sales — {confirmed} item"
-                      f"{'' if confirmed == 1 else 's'} on sale"
+                      f"Kroger vegan sales — {len(deals)} item"
+                      f"{'' if len(deals) == 1 else 's'} on sale"
                   )
                   with open(out_path, "a") as fh:
                       fh.write(f"has_deals={'true' if deals else 'false'}\n")
