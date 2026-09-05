@@ -409,8 +409,11 @@ jobs:
         run: |
           printf '%s\n' "$BODY" > body.md
           printf '\n<sub>Reply <code>/check</code> to run this again.</sub>\n' >> body.md
+          # Assigning the issue notifies the owner under "Participating",
+          # which is on by default -- watching the repo is not.
           gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE ($(date -u +%b\ %-d))" --body-file body.md
+            --title "$TITLE ($(date -u +%b\ %-d))" --body-file body.md \
+            --assignee "$GITHUB_REPOSITORY_OWNER"
 
       - name: Reply in thread when a /check run found nothing
         if: >-
