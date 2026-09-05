@@ -1,0 +1,428 @@
+name: Kroger plant-based sales
+
+on:
+  schedule:
+    # Sundays 13:00 UTC = 6am Pacific (5am in winter)
+    - cron: "0 13 * * 0"
+  workflow_dispatch: {}
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.comment.author_association == 'OWNER' &&
+       contains(github.event.comment.body, '/check'))
+    steps:
+      - name: Acknowledge a /check comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes || true
+
+      - name: Write the checker script
+        run: |
+          cat > check_sales.py <<'CHECK_SALES_EOF'
+          #!/usr/bin/env python3
+          """
+          Weekly Kroger plant-based sale check.
+
+          Authenticates to the Kroger public API with the client_credentials grant,
+          resolves a store from a ZIP code, searches a curated list of brands that
+          are vegan across their entire line, and reports items whose promo price
+          beats their regular price.
+
+          Outputs a markdown digest on stdout and, when GITHUB_OUTPUT is set,
+          exposes `has_deals`, `title` and `body` for the calling workflow.
+
+          Environment:
+            KROGER_CLIENT_ID      (required)  API client id
+            KROGER_CLIENT_SECRET  (required)  API client secret
+            KROGER_ZIP            (required)  ZIP code used to pick a store
+            KROGER_LOCATION_ID    (optional)  skip ZIP lookup, use this store id
+            KROGER_API_BASE       (optional)  default https://api.kroger.com
+            MIN_PERCENT_OFF       (optional)  default 0 -- report every discount
+          """
+
+          import base64
+          import json
+          import re
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          API_BASE = (os.environ.get("KROGER_API_BASE") or "https://api.kroger.com").rstrip("/")
+          TIMEOUT = 30
+
+          # ---------------------------------------------------------------------------
+          # Brand-driven search.
+          #
+          # Every brand below is vegan across its ENTIRE line, so anything the API
+          # returns under that brand is safe without inspecting the description. This
+          # replaced term-based searching on 2026-09-05: terms like "veggie burger" and
+          # "oat milk" dragged in hamburger buns, instant oatmeal, dairy yogurt and hand
+          # soap, and worse, "non-dairy" wrongly confirmed Coffee Mate creamers that
+          # contain sodium caseinate (a milk protein).
+          #
+          # The bar for this list is the whole brand, not a product. A brand with even
+          # one dairy, egg, fish or honey item does NOT belong here -- put it in
+          # MIXED_BRAND_NOTES instead so the reason is recorded.
+          # ---------------------------------------------------------------------------
+          VEGAN_BRANDS = [
+              # meat analogues
+              "Beyond Meat", "Beyond Burger", "Impossible", "Gardein", "Tofurky",
+              "Lightlife", "Field Roast", "Actual Veggies",
+              # dairy analogues
+              "Daiya", "Violife", "Miyoko's Creamery", "Miyoko", "Follow Your Heart",
+              "So Delicious", "Forager", "Kite Hill", "Chao",
+              # milks, creamers, drinks
+              "Silk", "Califia Farms", "Planet Oat", "Almond Breeze", "Oatly",
+              "Ripple", "Thai Coco", "Rise",
+              # yogurt
+              "Cocojune",
+              # eggs
+              "Just Egg", "JUST Egg",
+          ]
+
+          # Brands deliberately EXCLUDED, with the reason. These carry vegan products but
+          # are not vegan brands, so a brand-level match would be unsafe.
+          MIXED_BRAND_NOTES = {
+              "Coffee mate": "regular 'Non-Dairy' line contains sodium caseinate (milk protein)",
+              "Starbucks": "sells dairy creamers alongside the almond/oat ones",
+              "Best Foods": "mayonnaise line is egg-based; only the Plant Based SKU qualifies",
+              "Philadelphia": "a dairy cream cheese brand with one plant-based line",
+              "Breyers": "a dairy ice cream brand with one non-dairy line",
+              "Annie's": "most mac and cheese is dairy; only SKUs labelled Vegan qualify",
+              "Simple Truth": "Kroger house organic line spanning meat and dairy",
+              "Thai Kitchen": "also sells fish sauce",
+              "Blue Diamond": "also sells honey-roasted almonds",
+              "Dr. Praeger's": "veggie burgers are certified vegan but the brand also sells fish products",
+              "Orgain": "also sells whey protein",
+              "La Colombe": "most lattes are dairy; only the oatmilk ones qualify",
+          }
+
+          # Safety net. A brand on the list above should never produce a match here, but
+          # brands extend their lines. Anything caught is dropped and logged.
+          DISALLOWED = [
+              "milk chocolate", "buttermilk", "whey", "casein", "gelatin",
+              "honey", " beef", "pork", "chicken breast", "turkey breast",
+              "bacon", "anchov", "gouda", "cheddar cheese", "mozzarella",
+              "parmesan", "greek yogurt", "half and half", "heavy cream",
+              "egg ", "eggs", "lard", "tallow", "shrimp", "salmon", "tuna",
+          ]
+
+
+          def normalize(name):
+              """Fold brand strings for comparison: 'Gardein(R)' -> 'gardein'."""
+              return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+          VEGAN_BRAND_KEYS = {normalize(b) for b in VEGAN_BRANDS}
+
+
+          def fail(msg, hint=None):
+              print(f"ERROR: {msg}", file=sys.stderr)
+              if hint:
+                  print(f"HINT:  {hint}", file=sys.stderr)
+              sys.exit(1)
+
+
+          def request(url, data=None, headers=None, method=None):
+              body = data.encode() if isinstance(data, str) else data
+              req = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                      return json.loads(resp.read().decode() or "{}")
+              except urllib.error.HTTPError as e:
+                  detail = e.read().decode(errors="replace")[:400]
+                  raise RuntimeError(f"HTTP {e.code} from {url}\n{detail}") from None
+              except urllib.error.URLError as e:
+                  raise RuntimeError(f"could not reach {url}: {e.reason}") from None
+
+
+          def get_token(client_id, client_secret):
+              basic = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+              try:
+                  payload = request(
+                      f"{API_BASE}/v1/connect/oauth2/token",
+                      data=urllib.parse.urlencode(
+                          {"grant_type": "client_credentials", "scope": "product.compact"}
+                      ),
+                      headers={
+                          "Authorization": f"Basic {basic}",
+                          "Content-Type": "application/x-www-form-urlencoded",
+                      },
+                  )
+              except RuntimeError as e:
+                  fail(
+                      f"token request failed: {e}",
+                      "A 401 usually means the client id/secret are wrong or belong to a "
+                      "different environment. If your app is registered under "
+                      "Certification rather than Production, set the KROGER_API_BASE "
+                      "variable to https://api-ce.kroger.com.",
+                  )
+              token = payload.get("access_token")
+              if not token:
+                  fail(f"token response had no access_token: {payload}")
+              return token
+
+
+          def find_location(token, zip_code):
+              url = f"{API_BASE}/v1/locations?" + urllib.parse.urlencode(
+                  {"filter.zipCode.near": zip_code, "filter.limit": 1}
+              )
+              data = request(url, headers={"Authorization": f"Bearer {token}"})
+              items = data.get("data") or []
+              if not items:
+                  fail(f"no Kroger store found near ZIP {zip_code}")
+              store = items[0]
+              name = store.get("name", "store")
+              addr = (store.get("address") or {}).get("addressLine1", "")
+              city = (store.get("address") or {}).get("city", "")
+              return store["locationId"], f"{name}, {addr}, {city}".strip(", ")
+
+
+          PAGE_SIZE = 50
+          MAX_PAGES = 5  # Kroger caps filter.limit at 50, so this is up to 250 per brand
+
+
+          def search(token, term, location_id):
+              """Fetch every page for a term, not just the first 50.
+
+              A single page was silently truncating large brands -- Beyond Meat alone
+              exceeds 50 SKUs at a supercenter, so items genuinely on sale (Beyond Brats,
+              reported 2026-09-05) never reached the filter.
+              """
+              out = []
+              for page in range(MAX_PAGES):
+                  url = f"{API_BASE}/v1/products?" + urllib.parse.urlencode(
+                      {
+                          "filter.term": term,
+                          "filter.locationId": location_id,
+                          "filter.limit": PAGE_SIZE,
+                          "filter.start": page * PAGE_SIZE + 1,
+                      }
+                  )
+                  try:
+                      batch = (request(
+                          url, headers={"Authorization": f"Bearer {token}"}
+                      ).get("data")) or []
+                  except RuntimeError as e:
+                      print(f"  warning: {term!r} page {page + 1} failed: {e}",
+                            file=sys.stderr)
+                      break
+                  out.extend(batch)
+                  if len(batch) < PAGE_SIZE:
+                      break
+                  time.sleep(0.2)
+              else:
+                  print(f"  note: {term!r} hit the {MAX_PAGES}-page cap; may be truncated",
+                        file=sys.stderr)
+              return out
+
+
+          def classify(description, brand=""):
+              """Return 'vegan', 'excluded', or 'other'.
+
+              A product qualifies on its BRAND alone. The description is consulted only
+              to veto -- never to promote -- so a misleading label like "non-dairy"
+              can no longer let a non-vegan product through.
+              """
+              if normalize(brand) not in VEGAN_BRAND_KEYS:
+                  return "other"
+              low = f"{brand} {description}".lower()
+              for bad in DISALLOWED:
+                  if bad in low:
+                      return "excluded"
+              return "vegan"
+
+
+          def extract_deals(products, min_percent):
+              deals, vetoed = [], []
+              for p in products:
+                  desc = p.get("description") or ""
+                  brand = p.get("brand") or ""
+                  verdict = classify(desc, brand)
+                  if verdict == "other":
+                      continue
+                  if verdict == "excluded":
+                      vetoed.append(f"{brand} {desc}".strip())
+                      continue
+                  for item in p.get("items") or []:
+                      price = item.get("price") or {}
+                      regular = price.get("regular") or 0
+                      promo = price.get("promo") or 0
+                      # promo of 0 means "no promotion", not "free"
+                      if not (regular and promo and promo < regular):
+                          continue
+                      pct = round((regular - promo) / regular * 100)
+                      if pct < min_percent:
+                          continue
+                      deals.append(
+                          {
+                              "description": desc,
+                              "brand": brand,
+                              "size": item.get("size") or "",
+                              "regular": regular,
+                              "promo": promo,
+                              "percent": pct,
+                          }
+                      )
+                      break
+              return deals, vetoed
+
+
+          def dedupe(deals):
+              seen, out = set(), []
+              for d in sorted(deals, key=lambda x: -x["percent"]):
+                  key = (d["description"], d["size"])
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  out.append(d)
+              return out
+
+
+          def render(deals, store_label, zip_code):
+              lines = [
+                  f"Store: **{store_label}** (ZIP {zip_code})",
+                  "",
+              ]
+              if not deals:
+                  lines += [
+                      "Nothing from the tracked vegan brands is discounted this week.",
+                      "",
+                  ]
+              else:
+                  lines += [
+                      f"{len(deals)} item{'' if len(deals) == 1 else 's'} on sale.",
+                      "",
+                      "| Item | Size | Was | Now | Off |",
+                      "|---|---|---|---|---|",
+                  ]
+                  for d in deals:
+                      name = f"{d['brand']} {d['description']}".strip()
+                      lines.append(
+                          f"| {name} | {d['size']} | ${d['regular']:.2f} | "
+                          f"${d['promo']:.2f} | {d['percent']}% |"
+                      )
+                  lines.append("")
+
+              lines += [
+                  "---",
+                  "",
+                  "Every item comes from a brand that is vegan across its whole line, so "
+                  "no label check is needed. Prices are what the Kroger API reported for "
+                  "this store at run time and can differ at the register; digital-coupon "
+                  "savings are not included.",
+              ]
+              return "\n".join(lines)
+
+
+          def main():
+              client_id = os.environ.get("KROGER_CLIENT_ID")
+              client_secret = os.environ.get("KROGER_CLIENT_SECRET")
+              zip_code = os.environ.get("KROGER_ZIP")
+              location_id = os.environ.get("KROGER_LOCATION_ID") or ""
+              min_percent = int(os.environ.get("MIN_PERCENT_OFF") or 0)
+
+              if not client_id or not client_secret:
+                  fail(
+                      "KROGER_CLIENT_ID and KROGER_CLIENT_SECRET must be set",
+                      "Add them under Settings -> Secrets and variables -> Actions.",
+                  )
+              if not zip_code and not location_id:
+                  fail(
+                      "set KROGER_ZIP (or KROGER_LOCATION_ID)",
+                      "Add KROGER_ZIP under Settings -> Secrets and variables -> "
+                      "Actions -> Variables.",
+                  )
+
+              token = get_token(client_id, client_secret)
+
+              if location_id:
+                  store_label = f"location {location_id}"
+              else:
+                  location_id, store_label = find_location(token, zip_code)
+              print(f"Store: {store_label} ({location_id})", file=sys.stderr)
+
+              products = []
+              for brand in VEGAN_BRANDS:
+                  found = search(token, brand, location_id)
+                  kept = [p for p in found if normalize(p.get("brand")) in VEGAN_BRAND_KEYS]
+                  print(f"  {brand}: {len(found)} returned, {len(kept)} on-brand",
+                        file=sys.stderr)
+                  products.extend(kept)
+                  time.sleep(0.2)
+
+              raw, vetoed = extract_deals(products, min_percent)
+              for v in vetoed:
+                  print(f"  VETOED by DISALLOWED (check this brand): {v}", file=sys.stderr)
+              deals = dedupe(raw)
+              body = render(deals, store_label, zip_code or location_id)
+              print(body)
+
+              out_path = os.environ.get("GITHUB_OUTPUT")
+              if out_path:
+                  title = (
+                      f"Kroger vegan sales — {len(deals)} item"
+                      f"{'' if len(deals) == 1 else 's'} on sale"
+                  )
+                  with open(out_path, "a") as fh:
+                      fh.write(f"has_deals={'true' if deals else 'false'}\n")
+                      fh.write(f"title={title}\n")
+                      fh.write("body<<KROGER_EOF\n" + body + "\nKROGER_EOF\n")
+
+
+          if __name__ == "__main__":
+              main()
+          CHECK_SALES_EOF
+
+      - name: Check Kroger for plant-based sales
+        id: check
+        env:
+          KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
+          KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
+          KROGER_ZIP: ${{ vars.KROGER_ZIP }}
+          KROGER_LOCATION_ID: ${{ vars.KROGER_LOCATION_ID }}
+          KROGER_API_BASE: ${{ vars.KROGER_API_BASE }}
+          MIN_PERCENT_OFF: ${{ vars.MIN_PERCENT_OFF }}
+        run: python3 check_sales.py
+
+      - name: Open an issue with the results
+        if: steps.check.outputs.has_deals == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.check.outputs.title }}
+          BODY: ${{ steps.check.outputs.body }}
+        run: |
+          printf '%s\n' "$BODY" > body.md
+          printf '\n<sub>Reply <code>/check</code> to run this again.</sub>\n' >> body.md
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE ($(date -u +%b\ %-d))" --body-file body.md
+
+      - name: Reply in thread when a /check run found nothing
+        if: >-
+          steps.check.outputs.has_deals != 'true' &&
+          github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "Checked just now - nothing in the plant-based set is discounted at your store."
+
+      - name: Note when nothing is on sale
+        if: steps.check.outputs.has_deals != 'true'
+        run: echo "No plant-based items discounted; no issue opened."
