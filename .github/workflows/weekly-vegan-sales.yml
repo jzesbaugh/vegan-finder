@@ -1,0 +1,74 @@
+name: Weekly Kroger plant-based sales
+
+on:
+  schedule:
+    - cron: "0 13 * * 0"
+  workflow_dispatch: {}
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.comment.author_association == 'OWNER' &&
+       contains(github.event.comment.body, '/check'))
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acknowledge the /check comment
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --method POST \
+            "repos/$GITHUB_REPOSITORY/issues/comments/${{ github.event.comment.id }}/reactions" \
+            -f content=eyes || true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Kroger for plant-based sales
+        id: check
+        env:
+          KROGER_CLIENT_ID: ${{ secrets.KROGER_CLIENT_ID }}
+          KROGER_CLIENT_SECRET: ${{ secrets.KROGER_CLIENT_SECRET }}
+          KROGER_ZIP: ${{ vars.KROGER_ZIP }}
+          KROGER_LOCATION_ID: ${{ vars.KROGER_LOCATION_ID }}
+          KROGER_API_BASE: ${{ vars.KROGER_API_BASE }}
+          MIN_PERCENT_OFF: ${{ vars.MIN_PERCENT_OFF }}
+        run: python scripts/check_sales.py
+
+      - name: Open an issue with the results
+        if: steps.check.outputs.has_deals == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: ${{ steps.check.outputs.title }}
+          BODY: ${{ steps.check.outputs.body }}
+        run: |
+          printf '%s\n' "$BODY" > body.md
+          printf '\n<sub>Reply <code>/check</code> to run this again.</sub>\n' >> body.md
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE ($(date -u +%b\ %-d))" \
+            --body-file body.md
+
+      - name: Reply when a /check run found nothing
+        if: >-
+          steps.check.outputs.has_deals != 'true' &&
+          github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --body "Checked just now — nothing in the plant-based set is discounted at your store."
+
+      - name: Note when nothing is on sale
+        if: steps.check.outputs.has_deals != 'true'
+        run: echo "No plant-based items discounted; no issue opened."
